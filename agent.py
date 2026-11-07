@@ -54,12 +54,16 @@ import strategy  # noqa: E402
 
 def new_half(config: AgentConfig, memory: dict) -> None:
     """Called at the start of each half-match (1000 hands). `memory` is a fresh dict."""
-    memory.update(strategy.fresh_memory(config))
+    try:
+        memory.update(strategy.fresh_memory(config))
+    except Exception:
+        pass  # choose_action repairs memory on its own
 
 
 def choose_action(obs: Observation, memory: dict) -> Action:
     """Called every time it is your turn. Always returns one of obs.legal_actions."""
     try:
+        strategy.ensure_memory(memory)
         action = strategy.decide(obs, memory)
         if action in obs.legal_actions:
             return action

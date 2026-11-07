@@ -31,15 +31,17 @@ from game import Action, HandResult, Observation, Street
 
 RAISES = (Action.RAISE_HALF, Action.RAISE_POT)
 
-# "Polite" baselines: roughly what a sound, non-exploitative heads-up player does.
-AGG_BASE = 0.35      # postflop bet/raise frequency
-PFR_BASE = 0.45      # preflop raise frequency
-FTB_BASE = 0.45      # fold-to-bet frequency
-BLUFF_BASE = 0.20    # weak hand shown after river aggression
+# "Polite" baselines = what OUR OWN non-adaptive baseline measures when it plays itself
+# (1000-deal self-match, TFT_DISABLED=1 TFT_DEBUG=1, see STRATEGY.md). A mirror opponent
+# therefore produces zero deviation, and only real differences trigger a response.
+AGG_BASE = 0.24      # postflop bet/raise frequency       (measured 0.21-0.27)
+PFR_BASE = 0.40      # preflop raise frequency            (measured 0.38-0.42)
+FTB_BASE = 0.36      # fold-to-bet frequency              (measured 0.30-0.42)
+BLUFF_BASE = 0.05    # weak hand shown after river aggression (measured 0.005; 0.05 leaves slack)
 SCALE = 0.30         # deviation of this size = a full ±1
 
-ALPHA_ACTION = 0.03  # EWMA step for per-action stats (half-life ~23 actions)
-ALPHA_HAND = 0.05    # EWMA step for per-hand stats (half-life ~14 hands)
+ALPHA_ACTION = 0.02  # EWMA step for per-action stats (half-life ~35 actions)
+ALPHA_HAND = 0.04    # EWMA step for per-hand stats (half-life ~17 hands)
 
 # Minimum observations before a stat has full weight (linear ramp from 0).
 RAMP_ACTIONS = 25
@@ -96,6 +98,8 @@ class OpponentModel:
         if obs.hand_index != self.hand_index:
             self._start_hand(obs.hand_index)
         hist = obs.action_history
+        if len(hist) < self.processed:      # inconsistent history: start the hand's count over
+            self.processed = 0
         prev_me_raised = False
         if self.processed > 0:
             prev = hist[self.processed - 1]
@@ -136,7 +140,8 @@ class OpponentModel:
                 self.fold_to_bet.add(0.0)        # they called our bet
             elif result.winner == "me":
                 self.fold_to_bet.add(1.0)        # they folded to our bet
-        if result.went_to_showdown and result.opp_hole is not None and len(result.board) == 5:
+        if (result.went_to_showdown and result.opp_hole is not None
+                and len(result.board) == 5 and len(result.opp_hole) == 5):
             if self.opp_river_aggr:
                 score = omaha_score(result.opp_hole, result.board)
                 weak = category_of(score) < TWO_PAIR

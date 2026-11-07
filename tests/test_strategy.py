@@ -158,3 +158,98 @@ def test_params_shift_in_the_right_direction():
     if not strategy.TFT_DISABLED:
         assert p2.open_raise < base.open_raise        # steal more vs a folder
         assert p2.bluff_rate > base.bluff_rate
+
+
+# ----- hardening: the bot must never get stuck or crash ------------------------------------
+
+def test_choose_action_with_empty_memory():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("agent_h", os.path.join(ROOT, "agent.py"))
+    agent = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(agent)
+    memory = {}                                   # as if new_half had failed
+    game = Game(make_deal("empty", 0), 0, 0)
+    obs = game.observation(0)
+    act = agent.choose_action(obs, memory)
+    assert act in obs.legal_actions
+    assert "model" in memory and "rng" in memory  # repaired
+    memory["eq_cache"] = "corrupt"                # wrong type gets replaced too
+    strategy.ensure_memory(memory)
+    assert isinstance(memory["eq_cache"], dict)
+    agent.on_hand_end(game.hand_result(0) if game.is_terminal else _finish(game, 0), memory)
+
+
+def _finish(game, seat):
+    while not game.is_terminal:
+        game.apply(Action.CHECK_CALL)
+    return game.hand_result(seat)
+
+
+def test_fuzz_many_hands_mixed_opponent():
+    memory = strategy.fresh_memory(AgentConfig())
+    rng = random.Random("fuzz")
+    for h in range(1000):
+        rate = rng.choice((0.0, 0.3, 0.7, 1.0))
+        game = Game(make_deal("fuzz", h), button_seat=h % 2, hand_index=h)
+        while not game.is_terminal:
+            seat = game.to_act
+            obs = game.observation(seat)
+            if seat == 0:
+                act = strategy.decide(obs, memory)
+                assert act in obs.legal_actions
+            else:
+                raises = [a for a in obs.legal_actions if a in (Action.RAISE_HALF, Action.RAISE_POT)]
+                if raises and rng.random() < rate:
+                    act = rng.choice(raises)
+                elif Action.FOLD in obs.legal_actions and rng.random() < 0.1:
+                    act = Action.FOLD
+                else:
+                    act = Action.CHECK_CALL
+            game.apply(act)
+        strategy.hand_ended(game.hand_result(0), memory)
+    assert memory["hands_played"] == 1000
+    assert memory["time_used"] < 6.0
+
+
+def test_model_tolerates_odd_histories():
+    m = OpponentModel()
+    long_hist = [ObservedAction(Street.PREFLOP, False, Action.RAISE_POT, 5, 6),
+                 ObservedAction(Street.PREFLOP, True, Action.CHECK_CALL, 4, 6)]
+    m.observe(_obs_with_history(3, long_hist))
+    m.observe(_obs_with_history(3, long_hist[:1]))   # shorter than processed: must not raise
+    m.observe(_obs_with_history(3, long_hist))        # repeated
+    from game import HandResult
+    # a hand we never acted in (opponent folded preflop before our turn)
+    m.hand_ended(HandResult(hand_index=7, my_net=1, pot=3, went_to_showdown=False, board=(), opp_hole=None, winner="me"))
+    # showdown with a short board (should be impossible, but must not raise)
+    m.hand_ended(HandResult(hand_index=8, my_net=0, pot=4, went_to_showdown=True, board=(1, 2, 3), opp_hole=(4, 5, 6, 7, 8), winner="split"))
+    assert m.hands == 2
+
+
+def test_soften_dead_zone():
+    assert strategy.soften(0.1) == 0.0 and strategy.soften(-0.1) == 0.0
+    assert strategy.soften(1.0) == pytest.approx(1.0)
+    assert 0.0 < strategy.soften(0.5) < 0.5
+
+
+def test_commit_guard_downgrades_marginal_stack_off():
+    game = Game(make_deal("cg", 0), 0, 0)
+    game.apply(Action.RAISE_POT); game.apply(Action.RAISE_POT); game.apply(Action.CHECK_CALL)  # 3-bet pot
+    obs = game.observation(game.to_act)              # flop, pot 36, stacks 62: pot bet commits 36/62 = 58%
+    assert obs.street == Street.FLOP and obs.to_call == 0
+    big = obs.raise_to[Action.RAISE_POT] - obs.my_bet
+    if big >= strategy.COMMIT_FRACTION * obs.my_stack:
+        assert strategy._commit_guard(Action.RAISE_POT, 0.73, 0.72, obs) == Action.RAISE_HALF
+    assert strategy._commit_guard(Action.RAISE_POT, 0.95, 0.72, obs) == Action.RAISE_POT
+
+
+def test_styles_shift_params():
+    tight = strategy.Params(); loose = strategy.Params()
+    saved = strategy.TIGHTNESS
+    try:
+        strategy.TIGHTNESS = 1.0; tight = strategy.base_params()
+        strategy.TIGHTNESS = -1.0; loose = strategy.base_params()
+    finally:
+        strategy.TIGHTNESS = saved
+    assert tight.bet_pot > strategy.Params().bet_pot > loose.bet_pot
+    assert tight.open_raise > loose.open_raise
